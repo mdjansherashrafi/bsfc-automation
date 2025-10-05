@@ -1,4 +1,4 @@
-name: OKE Deploy (Concise)
+name: OKE Deploy (Concise_01)
 
 on:
   workflow_dispatch:
