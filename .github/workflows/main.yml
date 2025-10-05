@@ -216,13 +216,26 @@ jobs:
 
           kubectl cluster-info
 
-      - name: Deploy to OKE
-        shell: bash
-        run: |
+          - name: Verify Reachability
+            shell: bash
+            run: |
           set -euxo pipefail
-          kubectl get ns | grep -q "^nginx" || kubectl create namespace nginx
-          kubectl apply -n nginx -f https://k8s.io/examples/application/deployment.yaml
-          kubectl rollout status -n nginx deploy/nginx-deployment --timeout=180s
+          echo "kubectl version --short"
+          kubectl version --short
+          echo "kubectl cluster-info"
+          kubectl cluster-info
+          echo "List nodes (no changes applied)"
+          kubectl get nodes -o wide
+          echo "List namespaces (read-only)"
+          kubectl get ns
+
+   #   - name: Deploy to OKE
+     #   shell: bash
+      #  run: |
+       #   set -euxo pipefail
+        #  kubectl get ns | grep -q "^nginx" || kubectl create namespace nginx
+         # kubectl apply -n nginx -f https://k8s.io/examples/application/deployment.yaml
+          # kubectl rollout status -n nginx deploy/nginx-deployment --timeout=180s
 
       - name: Delete OCI Bastion Session
         if: always()
