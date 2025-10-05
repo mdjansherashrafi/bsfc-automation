@@ -84,7 +84,7 @@ jobs:
            fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
            key_file=$HOME/.oci/oci_api_key.pem
            region=${{ secrets.OCI_CLI_REGION }}
-            EOF
+         EOF
   
          chmod 600 "$HOME/.oci/config"
 
