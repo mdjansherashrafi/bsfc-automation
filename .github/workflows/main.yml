@@ -59,6 +59,37 @@ jobs:
 
           chmod 600 ~/.ssh/id_rsa ~/.ssh/config
           ls -l ~/.ssh/
+      - name: Setup OCI CLI credentials
+        shell: bash
+        run: |
+         set -euo pipefail
+
+          mkdir -p "$HOME/.oci"
+          chmod 700 "$HOME/.oci"
+
+         # If you stored the private key as base64 to preserve newlines, decode it here.
+           if [ -n "${{ secrets.OCI_CLI_KEY_B64 || '' }}" ]; then
+            echo "${{ secrets.OCI_CLI_KEY_B64 }}" | base64 -d > "$HOME/.oci/oci_api_key.pem"
+           else
+         # Fallback: direct content secret (must include proper newlines)
+           printf "%s" "${{ secrets.OCI_CLI_KEY_CONTENT }}" > "$HOME/.oci/oci_api_key.pem"
+           fi
+
+         chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+           user=${{ secrets.OCI_CLI_USER }}
+           tenancy=${{ secrets.OCI_CLI_TENANCY }}
+           fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+           key_file=$HOME/.oci/oci_api_key.pem
+           region=${{ secrets.OCI_CLI_REGION }}
+            EOF
+  
+         chmod 600 "$HOME/.oci/config"
+
+         # Quick validation
+           oci iam region list --config-file "$HOME/.oci/config" --profile DEFAULT >/dev/null
 
       - name: Create Bastion Session
         shell: bash
