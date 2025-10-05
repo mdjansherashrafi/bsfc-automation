@@ -23,17 +23,13 @@ jobs:
         run: |
           set -euxo pipefail
           if ! command -v oci >/dev/null 2>&1; then
-            echo "Installing OCI CLI..."
             curl -fsSL -o install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
             chmod +x install.sh
             sudo ./install.sh --accept-all-defaults \
               --install-dir /usr/local/lib/oracle-cli \
               --exec-dir /usr/local/bin
             hash -r
-          else
-            echo "OCI CLI already installed"
           fi
-          which oci
           oci --version
 
       - name: Setup SSH (for Bastion)
@@ -83,7 +79,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Get OKE private API endpoint (may include :6443)
+          # Resolve OKE private IP
           ENDPOINT=$(
             oci ce cluster get \
               --config-file "$HOME/.oci/config" \
@@ -107,21 +103,44 @@ jobs:
             --wait-for-state SUCCEEDED \
             > "$HOME/bastion_session.json"
 
-          # Ensure JSON was written
-          test -s "$HOME/bastion_session.json" || { echo "No JSON written by OCI CLI"; exit 1; }
+          # Validate file content is JSON
+          if [ ! -s "$HOME/bastion_session.json" ] || ! head -c1 "$HOME/bastion_session.json" | grep -q '{'; then
+            echo "OCI CLI did not produce JSON to stdout. Captured file:"
+            ls -l "$HOME/bastion_session.json" || true
+            echo "CLI stdout preview (re-exec without redirect for debug):"
+            oci bastion session create-port-forwarding \
+              --config-file "$HOME/.oci/config" \
+              --bastion-id "${{ secrets.BASTION_OCID }}" \
+              --display-name "ga-to-oke-tunnel-dbg" \
+              --ssh-public-key-file "$HOME/.ssh/id_rsa_updated.pub" \
+              --key-type PUB \
+              --target-private-ip "${OKE_PRIVATE_IP}" \
+              --target-port 6443 \
+              --wait-for-state SUCCEEDED
+            exit 1
+          fi
 
-          # Parse the Bastion Session OCID from either a direct session payload or a work request payload
-          BASTION_SESSION_OCID=$(jq -r '
-            # Case 1: direct session object
-            (select(type=="object") | .data.id | select(type=="string") | select(test("^ocid1\\.bastionsession"))) //
-            # Case 2: work request object -> resources[].identifier or entity-uri
-            (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .identifier | select(type=="string")) //
-            (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .["entity-uri"] | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id)
-          ' "$HOME/bastion_session.json")
+          # Parse Session OCID from work request or session object safely
+          BASTION_SESSION_OCID=$(
+            jq -r '
+              try(
+                # Direct session payload
+                .data.id | select(type=="string") | select(test("^ocid1\\.bastionsession"))
+              ) //
+              try(
+                # Work request -> resources[].identifier
+                (.data.resources // []) | map(select(.entity-type=="SessionResource")) | .[0].identifier
+              ) //
+              try(
+                # Work request -> entity-uri
+                (.data.resources // []) | map(select(.entity-type=="SessionResource")) | .[0].["entity-uri"] | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id
+              ) //
+              empty
+            ' "$HOME/bastion_session.json"
+          )
 
-          if [ -z "${BASTION_SESSION_OCID}" ] || [ "${BASTION_SESSION_OCID}" = "null" ] || [[ "${BASTION_SESSION_OCID}" != ocid1.bastionsession* ]]; then
-            echo "Failed to parse valid Bastion session OCID"
-            echo "Response was:"
+          if [ -z "${BASTION_SESSION_OCID}" ]; then
+            echo "Failed to parse Bastion session OCID. Full response:"
             cat "$HOME/bastion_session.json"
             exit 1
           fi
@@ -145,13 +164,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Use Bastion Session OCID as SSH username and the matching private key
           ssh -i "$HOME/.ssh/id_rsa" \
               -o StrictHostKeyChecking=accept-new \
               -fN -L 6443:${{ env.oke_private_ip }}:6443 \
               "${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }}"
 
-          # Wait for local port to be ready
           for i in {1..15}; do
             if nc -z 127.0.0.1 6443; then
               echo "Tunnel is up."
@@ -173,11 +190,7 @@ jobs:
             --region "${{ secrets.OCI_CLI_REGION }}" \
             --token-version 2.0.0 \
             --kube-endpoint PRIVATE_ENDPOINT
-
-          # Rewrite server to use local tunnel
           sed -i "s|${{ env.oke_private_ip }}|127.0.0.1|g" "$HOME/.kube/config"
-
-          # Sanity check
           kubectl cluster-info
 
       - name: Deploy to OKE
@@ -194,12 +207,15 @@ jobs:
         run: |
           set -euxo pipefail
           if [ -f "$HOME/bastion_session.json" ]; then
-            BASTION_SESSION_OCID=$(jq -r '
-              (select(type=="object") | .data.id | select(type=="string") | select(test("^ocid1\\.bastionsession"))) //
-              (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .identifier | select(type=="string")) //
-              (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .["entity-uri"] | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id)
-            ' "$HOME/bastion_session.json")
-            if [ -n "$BASTION_SESSION_OCID" ] && [ "$BASTION_SESSION_OCID" != "null" ]; then
+            BASTION_SESSION_OCID=$(
+              jq -r '
+                try(.data.id | select(type=="string") | select(test("^ocid1\\.bastionsession"))) //
+                try((.data.resources // []) | map(select(.entity-type=="SessionResource")) | .[0].identifier) //
+                try((.data.resources // []) | map(select(.entity-type=="SessionResource")) | .[0].["entity-uri"] | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id) //
+                empty
+              ' "$HOME/bastion_session.json"
+            )
+            if [ -n "$BASTION_SESSION_OCID" ]; then
               oci bastion session delete --config-file "$HOME/.oci/config" --session-id "${BASTION_SESSION_OCID}" --force
             else
               echo "No valid Bastion session id found; skipping delete."
