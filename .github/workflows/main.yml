@@ -13,6 +13,7 @@ jobs:
       OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
     steps:
       - name: Check OCI CLI installation
+        timeout-minutes: 10  # Add timeout
         run: |  
           if ! command -v oci &> /dev/null; then
             echo "OCI CLI not found, installing..."
