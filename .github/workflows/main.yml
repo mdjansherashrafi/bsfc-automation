@@ -216,9 +216,9 @@ jobs:
 
           kubectl cluster-info
 
-          - name: Verify Reachability
-            shell: bash
-            run: |
+      - name: Verify Reachability
+        shell: bash
+        run: |
           set -euxo pipefail
           echo "kubectl version --short"
           kubectl version --short
