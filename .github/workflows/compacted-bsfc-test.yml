@@ -1,0 +1,165 @@
+name: OKE Deploy (Concise)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Full image reference (e.g., <region>.ocir.io/ns/repo:tag)"
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI CLI and kubectl
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! command -v oci >/dev/null 2>&1; then
+            curl -fsSL -o install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+            chmod +x install.sh
+            sudo ./install.sh --accept-all-defaults --install-dir /usr/local/lib/oracle-cli --exec-dir /usr/local/bin
+            hash -r
+          fi
+          KVER=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
+      - name: Configure OCI CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.oci"
+          printf "%s" "${{ secrets.OCI_CLI_KEY_CONTENT }}" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_CLI_USER }}
+          tenancy=${{ secrets.OCI_CLI_TENANCY }}
+          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+          key_file=$HOME/.oci/oci_api_key.pem
+          region=${{ secrets.OCI_CLI_REGION }}
+          EOF
+          chmod 600 "$HOME/.oci/config"
+
+      - name: Setup SSH for Bastion
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+          ssh-keyscan -H "${{ secrets.BASTION_HOST }}" >> ~/.ssh/known_hosts
+          tr -d '\n' < ~/.ssh/id_rsa.pub > ~/.ssh/id_rsa_updated.pub
+          {
+            echo "Host ${{ secrets.BASTION_HOST }}"
+            echo "    IdentityFile ~/.ssh/id_rsa"
+            echo "    StrictHostKeyChecking accept-new"
+          } >> ~/.ssh/config
+          chmod 600 ~/.ssh/id_rsa ~/.ssh/config
+
+      - name: Create Bastion Session and Tunnel to OKE
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ENDPOINT=$(oci ce cluster get \
+            --config-file "$HOME/.oci/config" \
+            --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
+            --query 'data."endpoints"."private-endpoint"' \
+            --raw-output)
+          OKE_PRIVATE_IP="${ENDPOINT%%:*}"
+          echo "oke_private_ip=${OKE_PRIVATE_IP}" >> "$GITHUB_ENV"
+
+          oci bastion session create-port-forwarding \
+            --config-file "$HOME/.oci/config" \
+            --bastion-id "${{ secrets.BASTION_OCID }}" \
+            --display-name "ga-to-oke-tunnel" \
+            --ssh-public-key-file "$HOME/.ssh/id_rsa_updated.pub" \
+            --key-type PUB \
+            --target-private-ip "${OKE_PRIVATE_IP}" \
+            --target-port 6443 \
+            --wait-for-state SUCCEEDED > "$HOME/bastion_session.json"
+
+          JQ_PROGRAM='
+            def pick:
+              if (.data? // {} | .id? // "" | type == "string") and (.data.id | test("^ocid1\\.bastionsession")) then .data.id
+              else
+                (.data? // {} | .resources? // []) as $r
+                | ($r | map(select(.["entity-type"] == "SessionResource" or .entityType == "SessionResource")) | .[0]? ) as $sr
+                | if ($sr|type) == "object" then
+                    if ($sr.identifier? // "" | startswith("ocid1.bastionsession")) then $sr.identifier
+                    else ($sr["entity-uri"]? // $sr["entityUri"]? // "" | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id?)
+                    end
+                  else empty end
+              end;
+            pick
+          '
+          BASTION_SESSION_OCID="$(jq -r "$JQ_PROGRAM" "$HOME/bastion_session.json")"
+          if [ -z "$BASTION_SESSION_OCID" ] || [[ "$BASTION_SESSION_OCID" != ocid1.bastionsession* ]]; then
+            echo "Failed to parse Bastion session OCID"; exit 1
+          fi
+          echo "bastion_session_ocid=${BASTION_SESSION_OCID}" >> "$GITHUB_ENV"
+
+          ssh -i "$HOME/.ssh/id_rsa" -o StrictHostKeyChecking=accept-new \
+              -fN -L 6443:${OKE_PRIVATE_IP}:6443 \
+              "${BASTION_SESSION_OCID}@${{ secrets.BASTION_HOST }}"
+          for i in {1..20}; do nc -z 127.0.0.1 6443 && break; sleep 2; done
+
+      - name: Configure kubeconfig
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.kube"
+          oci ce cluster create-kubeconfig \
+            --config-file "$HOME/.oci/config" \
+            --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
+            --file "$HOME/.kube/config" \
+            --region "${{ secrets.OCI_CLI_REGION }}" \
+            --token-version 2.0.0 \
+            --kube-endpoint PRIVATE_ENDPOINT
+          sed -i "s|${{ env.oke_private_ip }}|127.0.0.1|g" "$HOME/.kube/config"
+          kubectl cluster-info
+
+      - name: Verify Reachability
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "kubectl version --short"
+          kubectl version --short
+          echo "kubectl cluster-info"
+          kubectl cluster-info
+          echo "List nodes (no changes applied)"
+          kubectl get nodes -o wide
+          echo "List namespaces (read-only)"
+          kubectl get ns
+
+      - name: Cleanup Bastion Session
+        if: always()
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f "$HOME/bastion_session.json" ]; then
+            JQ_PROGRAM='
+              if (.data? // {} | .id? // "" | test("^ocid1\\.bastionsession")) then .data.id
+              else
+                (.data? // {} | .resources? // []) as $r
+                | ($r | map(select(.["entity-type"] == "SessionResource" or .entityType == "SessionResource")) | .[0]? ) as $sr
+                | if ($sr|type) == "object" then
+                    if ($sr.identifier? // "" | startswith("ocid1.bastionsession")) then $sr.identifier
+                    else ($sr["entity-uri"]? // $sr["entityUri"]? // "" | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id?)
+                    end
+                  else empty end
+              end
+            '
+            SID="$(jq -r "$JQ_PROGRAM" "$HOME/bastion_session.json" || true)"
+            [ -n "$SID" ] && [[ "$SID" == ocid1.bastionsession* ]] && oci bastion session delete --config-file "$HOME/.oci/config" --session-id "$SID" --force || true
+          fi
