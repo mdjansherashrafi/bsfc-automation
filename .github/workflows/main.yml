@@ -42,13 +42,9 @@ jobs:
           set -euxo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          # Generate keypair used for Bastion session authentication
           ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
-          # Known hosts
           ssh-keyscan -H "${{ secrets.BASTION_HOST }}" >> ~/.ssh/known_hosts
-          # Public key (flatten into single line for CLI)
           tr -d '\n' < ~/.ssh/id_rsa.pub > ~/.ssh/id_rsa_updated.pub
-          # SSH config
           {
             echo "Host ${{ secrets.BASTION_HOST }}"
             echo "    IdentityFile ~/.ssh/id_rsa"
@@ -60,18 +56,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "$HOME/.oci"
           chmod 700 "$HOME/.oci"
-
-          # Prefer base64 secret to preserve PEM newlines
           if [ -n "${{ secrets.OCI_CLI_KEY_B64 || '' }}" ]; then
             echo "${{ secrets.OCI_CLI_KEY_B64 }}" | base64 -d > "$HOME/.oci/oci_api_key.pem"
           else
             printf "%s" "${{ secrets.OCI_CLI_KEY_CONTENT }}" > "$HOME/.oci/oci_api_key.pem"
           fi
           chmod 600 "$HOME/.oci/oci_api_key.pem"
-
           cat > "$HOME/.oci/config" <<EOF
           [DEFAULT]
           user=${{ secrets.OCI_CLI_USER }}
@@ -81,8 +73,6 @@ jobs:
           region=${{ secrets.OCI_CLI_REGION }}
           EOF
           chmod 600 "$HOME/.oci/config"
-
-          # Validate authentication early
           oci iam region list --config-file "$HOME/.oci/config" --profile DEFAULT >/dev/null
 
       - name: Create Bastion Session and Resolve OKE Private IP
@@ -90,7 +80,6 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Get OKE private API endpoint (may include :6443)
           ENDPOINT=$(
             oci ce cluster get \
               --config-file "$HOME/.oci/config" \
@@ -98,12 +87,10 @@ jobs:
               --query 'data."endpoints"."private-endpoint"' \
               --raw-output
           )
-          # Extract only the IP (strip optional :port)
           OKE_PRIVATE_IP="${ENDPOINT%%:*}"
           echo "oke_private_ip=${OKE_PRIVATE_IP}" >> "$GITHUB_ENV"
           echo "Resolved OKE_PRIVATE_IP=${OKE_PRIVATE_IP}"
 
-          # Create Bastion port-forwarding session (target-private-ip must be IP only)
           oci bastion session create-port-forwarding \
             --config-file "$HOME/.oci/config" \
             --bastion-id "${{ secrets.BASTION_OCID }}" \
@@ -114,12 +101,20 @@ jobs:
             --target-port 6443 \
             --wait-for-state SUCCEEDED > "$HOME/bastion_session.json"
 
-          # Extract session OCID (must be ocid1.bastionsession...)
-          BASTION_SESSION_OCID=$(jq -r '.data.id' "$HOME/bastion_session.json")
+          # Parse the Bastion Session OCID from the work request
+          BASTION_SESSION_OCID=$(jq -r '
+            .data.id | select(test("^ocid1\\.bastionsession")) //
+            (.data.resources[]? | select(.entity-type=="SessionResource") | .identifier) //
+            (.data.resources[]? | select(.entity-type=="SessionResource") | .["entity-uri"] | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id)
+          ' "$HOME/bastion_session.json")
+
           if [ -z "${BASTION_SESSION_OCID}" ] || [ "${BASTION_SESSION_OCID}" = "null" ] || [[ "${BASTION_SESSION_OCID}" != ocid1.bastionsession* ]]; then
-            echo "Failed to parse valid Bastion session OCID"; cat "$HOME/bastion_session.json"; exit 1
+            echo "Failed to parse valid Bastion session OCID"
+            cat "$HOME/bastion_session.json"
+            exit 1
           fi
           echo "bastion_session_ocid=${BASTION_SESSION_OCID}" >> "$GITHUB_ENV"
+          echo "Parsed Bastion Session: ${BASTION_SESSION_OCID}"
 
       - name: Install kubectl
         shell: bash
@@ -137,13 +132,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          # Use Bastion Session OCID as SSH username and the matching private key
           ssh -i "$HOME/.ssh/id_rsa" \
               -o StrictHostKeyChecking=accept-new \
               -fN -L 6443:${{ env.oke_private_ip }}:6443 \
               "${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }}"
 
-          # Wait for local port to be ready
           for i in {1..15}; do
             if nc -z 127.0.0.1 6443; then
               echo "Tunnel is up."
@@ -166,10 +159,7 @@ jobs:
             --token-version 2.0.0 \
             --kube-endpoint PRIVATE_ENDPOINT
 
-          # Rewrite server to use local tunnel
           sed -i "s|${{ env.oke_private_ip }}|127.0.0.1|g" "$HOME/.kube/config"
-
-          # Sanity check
           kubectl cluster-info
 
       - name: Deploy to OKE
@@ -186,11 +176,16 @@ jobs:
         run: |
           set -euxo pipefail
           if [ -f "$HOME/bastion_session.json" ]; then
-            BASTION_SESSION_OCID=$(jq -r '.data.id' "$HOME/bastion_session.json")
+            # Re-parse in case env was lost
+            BASTION_SESSION_OCID=$(jq -r '
+              .data.id | select(test("^ocid1\\.bastionsession")) //
+              (.data.resources[]? | select(.entity-type=="SessionResource") | .identifier) //
+              (.data.resources[]? | select(.entity-type=="SessionResource") | .["entity-uri"] | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id)
+            ' "$HOME/bastion_session.json")
             if [ -n "$BASTION_SESSION_OCID" ] && [ "$BASTION_SESSION_OCID" != "null" ]; then
               oci bastion session delete --config-file "$HOME/.oci/config" --session-id "${BASTION_SESSION_OCID}" --force
             else
-              echo "bastion_session.json does not contain a valid session id; skipping delete."
+              echo "No valid Bastion session id found; skipping delete."
             fi
           else
             echo "No bastion_session.json found; skipping delete."
