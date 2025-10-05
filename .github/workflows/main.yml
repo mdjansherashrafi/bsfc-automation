@@ -42,13 +42,9 @@ jobs:
           set -euxo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          # Generate keypair used for Bastion session authentication
           ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
-          # Known hosts
           ssh-keyscan -H "${{ secrets.BASTION_HOST }}" >> ~/.ssh/known_hosts
-          # Public key (flatten into single line for CLI)
           tr -d '\n' < ~/.ssh/id_rsa.pub > ~/.ssh/id_rsa_updated.pub
-          # SSH config
           {
             echo "Host ${{ secrets.BASTION_HOST }}"
             echo "    IdentityFile ~/.ssh/id_rsa"
@@ -60,11 +56,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "$HOME/.oci"
           chmod 700 "$HOME/.oci"
 
-          # Prefer base64 secret to preserve PEM newlines
           if [ -n "${{ secrets.OCI_CLI_KEY_B64 || '' }}" ]; then
             echo "${{ secrets.OCI_CLI_KEY_B64 }}" | base64 -d > "$HOME/.oci/oci_api_key.pem"
           else
@@ -82,7 +76,6 @@ jobs:
           EOF
           chmod 600 "$HOME/.oci/config"
 
-          # Validate authentication early
           oci iam region list --config-file "$HOME/.oci/config" --profile DEFAULT >/dev/null
 
       - name: Create Bastion Session and Resolve OKE Private IP
@@ -98,12 +91,11 @@ jobs:
               --query 'data."endpoints"."private-endpoint"' \
               --raw-output
           )
-          # Extract only the IP (strip optional :port)
           OKE_PRIVATE_IP="${ENDPOINT%%:*}"
           echo "oke_private_ip=${OKE_PRIVATE_IP}" >> "$GITHUB_ENV"
           echo "Resolved OKE_PRIVATE_IP=${OKE_PRIVATE_IP}"
 
-          # Create Bastion port-forwarding session (target-private-ip must be IP only)
+          # Create Bastion port-forwarding session and SAVE THE JSON RESPONSE
           oci bastion session create-port-forwarding \
             --config-file "$HOME/.oci/config" \
             --bastion-id "${{ secrets.BASTION_OCID }}" \
@@ -121,9 +113,9 @@ jobs:
           # Parse the Bastion Session OCID from either a direct session payload or a work request payload
           BASTION_SESSION_OCID=$(jq -r '
             # Case 1: direct session object
-            (select(type=="object") | .data.id | select(test("^ocid1\\.bastionsession"))) //
+            (select(type=="object") | .data.id | select(type=="string") | select(test("^ocid1\\.bastionsession"))) //
             # Case 2: work request object -> resources[].identifier or entity-uri
-            (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .identifier) //
+            (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .identifier | select(type=="string")) //
             (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .["entity-uri"] | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id)
           ' "$HOME/bastion_session.json")
 
@@ -202,10 +194,9 @@ jobs:
         run: |
           set -euxo pipefail
           if [ -f "$HOME/bastion_session.json" ]; then
-            # Re-parse in case env was lost
             BASTION_SESSION_OCID=$(jq -r '
-              (select(type=="object") | .data.id | select(test("^ocid1\\.bastionsession"))) //
-              (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .identifier) //
+              (select(type=="object") | .data.id | select(type=="string") | select(test("^ocid1\\.bastionsession"))) //
+              (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .identifier | select(type=="string")) //
               (select(type=="object") | .data.resources[]? | select(.entity-type=="SessionResource") | .["entity-uri"] | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id)
             ' "$HOME/bastion_session.json")
             if [ -n "$BASTION_SESSION_OCID" ] && [ "$BASTION_SESSION_OCID" != "null" ]; then
