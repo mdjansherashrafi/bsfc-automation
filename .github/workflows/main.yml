@@ -80,90 +80,90 @@ jobs:
           set -euxo pipefail
 
           # Resolve OKE private IP
-set -euxo pipefail
+           set -euxo pipefail
 
-# Resolve OKE private IP
-ENDPOINT=$(
-  oci ce cluster get \
-    --config-file "$HOME/.oci/config" \
-    --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
-    --query 'data."endpoints"."private-endpoint"' \
-    --raw-output
-)
-OKE_PRIVATE_IP="${ENDPOINT%%:*}"
-echo "oke_private_ip=${OKE_PRIVATE_IP}" >> "$GITHUB_ENV"
-echo "Resolved OKE_PRIVATE_IP=${OKE_PRIVATE_IP}"
+          # Resolve OKE private IP
+            ENDPOINT=$(
+            oci ce cluster get \
+            --config-file "$HOME/.oci/config" \
+            --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
+            --query 'data."endpoints"."private-endpoint"' \
+            --raw-output
+          )
+            OKE_PRIVATE_IP="${ENDPOINT%%:*}"
+            echo "oke_private_ip=${OKE_PRIVATE_IP}" >> "$GITHUB_ENV"
+            echo "Resolved OKE_PRIVATE_IP=${OKE_PRIVATE_IP}"
 
-# Create Bastion port-forwarding session and SAVE THE JSON RESPONSE
-oci bastion session create-port-forwarding \
-  --config-file "$HOME/.oci/config" \
-  --bastion-id "${{ secrets.BASTION_OCID }}" \
-  --display-name "ga-to-oke-tunnel" \
-  --ssh-public-key-file "$HOME/.ssh/id_rsa_updated.pub" \
-  --key-type PUB \
-  --target-private-ip "${OKE_PRIVATE_IP}" \
-  --target-port 6443 \
-  --wait-for-state SUCCEEDED \
-  > "$HOME/bastion_session.json"
+          # Create Bastion port-forwarding session and SAVE THE JSON RESPONSE
+            oci bastion session create-port-forwarding \
+            --config-file "$HOME/.oci/config" \
+            --bastion-id "${{ secrets.BASTION_OCID }}" \
+            --display-name "ga-to-oke-tunnel" \
+            --ssh-public-key-file "$HOME/.ssh/id_rsa_updated.pub" \
+            --key-type PUB \
+            --target-private-ip "${OKE_PRIVATE_IP}" \
+            --target-port 6443 \
+            --wait-for-state SUCCEEDED \
+          > "$HOME/bastion_session.json"
 
-# Validate file content is JSON
-if [ ! -s "$HOME/bastion_session.json" ] || ! head -c1 "$HOME/bastion_session.json" | grep -q '{'; then
-  echo "OCI CLI did not produce JSON to stdout. Full stdout will be shown by re-run without redirect:"
-  oci bastion session create-port-forwarding \
-    --config-file "$HOME/.oci/config" \
-    --bastion-id "${{ secrets.BASTION_OCID }}" \
-    --display-name "ga-to-oke-tunnel-dbg" \
-    --ssh-public-key-file "$HOME/.ssh/id_rsa_updated.pub" \
-    --key-type PUB \
-    --target-private-ip "${OKE_PRIVATE_IP}" \
-    --target-port 6443 \
-    --wait-for-state SUCCEEDED
-  exit 1
-fi
-
-# jq program (safe via here-doc; avoids shell quoting glitches)
-read -r -d '' JQ_PROGRAM <<'JQ'
-  # Try direct session payload first
-  ( .data.id // "" ) as $id
-  | if ($id | type == "string" and ($id | test("^ocid1\\.bastionsession")))
-    then $id
-    else
-      # Work request path: resources[].identifier
-      ( .data.resources // [] )
-      | map(select(.["entity-type"] == "SessionResource"))
-      | if length > 0 then
-          (.[0].identifier // "") as $rid
-          | if ($rid | type == "string" and ($rid | startswith("ocid1.bastionsession")))
+          # Validate file content is JSON
+            if [ ! -s "$HOME/bastion_session.json" ] || ! head -c1 "$HOME/bastion_session.json" | grep -q '{'; then
+            echo "OCI CLI did not produce JSON to stdout. Full stdout will be shown by re-run without redirect:"
+            oci bastion session create-port-forwarding \
+            --config-file "$HOME/.oci/config" \
+            --bastion-id "${{ secrets.BASTION_OCID }}" \
+            --display-name "ga-to-oke-tunnel-dbg" \
+            --ssh-public-key-file "$HOME/.ssh/id_rsa_updated.pub" \
+            --key-type PUB \
+            --target-private-ip "${OKE_PRIVATE_IP}" \
+            --target-port 6443 \
+            --wait-for-state SUCCEEDED
+           exit 1
+          fi
+ 
+          # jq program (safe via here-doc; avoids shell quoting glitches)
+            read -r -d '' JQ_PROGRAM <<'JQ'
+          # Try direct session payload first
+           ( .data.id // "" ) as $id
+           | if ($id | type == "string" and ($id | test("^ocid1\\.bastionsession")))
+          then $id
+          else
+          # Work request path: resources[].identifier
+            ( .data.resources // [] )
+           | map(select(.["entity-type"] == "SessionResource"))
+           | if length > 0 then
+            (.[0].identifier // "") as $rid
+           | if ($rid | type == "string" and ($rid | startswith("ocid1.bastionsession")))
             then $rid
             else
               # Fallback: parse from entity-uri if present
               (.[0]["entity-uri"] // "") as $uri
               | if ($uri | type == "string" and ($uri | length) > 0)
                 then ($uri | capture("/sessions/(?<id>ocid1\\.bastionsession[^/]+)").id)
-                else empty
-                end
-            end
-        else empty
-        end
-    end
-JQ
+                  else empty
+                 end
+               end
+            else empty
+           end
+           end
+          JQ
 
-BASTION_SESSION_OCID=$(jq -r "$JQ_PROGRAM" "$HOME/bastion_session.json" || true)
+            BASTION_SESSION_OCID=$(jq -r "$JQ_PROGRAM" "$HOME/bastion_session.json" || true)
 
-if [ -z "${BASTION_SESSION_OCID}" ] || [ "${BASTION_SESSION_OCID}" = "null" ] || [[ "${BASTION_SESSION_OCID}" != ocid1.bastionsession* ]]; then
-  echo "Failed to parse valid Bastion session OCID"
-  echo "Response was:"
-  cat "$HOME/bastion_session.json"
-  exit 1
-fi
+           if [ -z "${BASTION_SESSION_OCID}" ] || [ "${BASTION_SESSION_OCID}" = "null" ] || [[ "${BASTION_SESSION_OCID}" != ocid1.bastionsession* ]]; then
+           echo "Failed to parse valid Bastion session OCID"
+           echo "Response was:"
+           cat "$HOME/bastion_session.json"
+            exit 1
+           fi
 
-echo "bastion_session_ocid=${BASTION_SESSION_OCID}" >> "$GITHUB_ENV"
-echo "Parsed Bastion Session: ${BASTION_SESSION_OCID}"
+            echo "bastion_session_ocid=${BASTION_SESSION_OCID}" >> "$GITHUB_ENV"
+            echo "Parsed Bastion Session: ${BASTION_SESSION_OCID}"
 
-      - name: Install kubectl
-        shell: bash
-        run: |
-          set -euxo pipefail
+            - name: Install kubectl
+              shell: bash
+              run: |
+              set -euxo pipefail
           KVER=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
           curl -fsSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
           curl -fsSLo kubectl.sha256 "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl.sha256"
