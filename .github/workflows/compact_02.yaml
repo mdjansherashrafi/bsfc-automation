@@ -1,0 +1,80 @@
+name: CI - Deploy to OKE
+
+on: [push]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up OCI CLI
+        uses: oracle-actions/oci-cli@v2
+        with:
+          oci-cli-version: latest
+          oci-config: |
+            [DEFAULT]
+            user=${{ secrets.OCI_CLI_USER }}
+            tenancy=${{ secrets.OCI_CLI_TENANCY }}
+            fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+            key_file=$HOME/.oci/oci_api_key.pem
+            region=${{ secrets.OCI_CLI_REGION }}
+        env:
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+
+      - name: Write OCI API Key
+        run: |
+          mkdir -p $HOME/.oci
+          echo "$OCI_CLI_KEY_CONTENT" > $HOME/.oci/oci_api_key.pem
+          chmod 600 $HOME/.oci/oci_api_key.pem
+
+      - name: Resolve OKE Private IP & create Bastion Session
+        run: |
+          OKE_IP=$(oci ce cluster get --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" --query 'data."endpoints"."private-endpoint"' --raw-output | cut -d: -f1)
+          echo "oke_private_ip=$OKE_IP" >> $GITHUB_ENV
+          SESSION_JSON=$(oci bastion session create-port-forwarding \
+            --bastion-id "${{ secrets.BASTION_OCID }}" \
+            --display-name github-tunnel \
+            --ssh-public-key-file ~/.oci/oci_api_key.pem \
+            --key-type PUB \
+            --target-private-ip $OKE_IP \
+            --target-port 6443 \
+            --wait-for-state SUCCEEDED)
+          echo "bastion_session_ocid=$(echo $SESSION_JSON | jq -r '.data.id')" >> $GITHUB_ENV
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubeconfig for OKE
+        run: |
+          oci ce cluster create-kubeconfig \
+            --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
+            --file ~/.kube/config \
+            --region "${{ secrets.OCI_CLI_REGION }}" \
+            --token-version 2.0.0 \
+            --kube-endpoint PRIVATE_ENDPOINT
+          sed -i "s|${{ env.oke_private_ip }}|127.0.0.1|g" ~/.kube/config
+          kubectl cluster-info
+
+      - name: Verify Cluster Access
+        run: |
+          kubectl version
+          kubectl get nodes -o wide
+          kubectl get ns
+          kubectl get pods -A
+
+      - name: Delete Bastion Session
+        if: always()
+        run: |
+          [ -n "${{ env.bastion_session_ocid }}" ] && \
+          oci bastion session delete --session-id "${{ env.bastion_session_ocid }}" --force || echo "No session to delete"
