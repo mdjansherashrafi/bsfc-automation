@@ -13,78 +13,75 @@ jobs:
       OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
 
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install OCI CLI
-        shell: bash
-        run: |
-          if ! command -v oci >/dev/null; then
-            curl -fsSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh -o install.sh
-            chmod +x install.sh
-            sudo ./install.sh --accept-all-defaults --install-dir /usr/local/lib/oracle-cli --exec-dir /usr/local/bin
-          fi
-          oci --version
+      - name: Set up OCI CLI
+        uses: oracle-actions/oci-cli@v2
+        with:
+          oci-cli-version: latest
+          oci-config: |
+            [DEFAULT]
+            user=${{ secrets.OCI_CLI_USER }}
+            tenancy=${{ secrets.OCI_CLI_TENANCY }}
+            fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+            key_file=$HOME/.oci/oci_api_key.pem
+            region=${{ secrets.OCI_CLI_REGION }}
+        env:
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
 
-      - name: Setup SSH for Bastion
-        shell: bash
+      - name: Write OCI API Key
         run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          ssh-keygen -t rsa -b 2048 -f ~/.ssh/id_rsa -N "" -q
-          ssh-keyscan -H "${{ secrets.BASTION_HOST }}" >> ~/.ssh/known_hosts
-          echo -e "Host ${{ secrets.BASTION_HOST }}\n  IdentityFile ~/.ssh/id_rsa\n  StrictHostKeyChecking accept-new" >> ~/.ssh/config
-          chmod 600 ~/.ssh/id_rsa ~/.ssh/config
-          tr -d '\n' < ~/.ssh/id_rsa.pub > ~/.ssh/id_rsa_updated.pub
+          mkdir -p $HOME/.oci
+          echo "$OCI_CLI_KEY_CONTENT" > $HOME/.oci/oci_api_key.pem
+          chmod 600 $HOME/.oci/oci_api_key.pem
 
-      - name: Configure OCI CLI
-        shell: bash
+      - name: Resolve OKE Private IP & create Bastion Session
         run: |
-          mkdir -p ~/.oci && chmod 700 ~/.oci
-          printf "%s" "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
-          cat > ~/.oci/config <<EOF
-          [DEFAULT]
-          user=${{ secrets.OCI_CLI_USER }}
-          tenancy=${{ secrets.OCI_CLI_TENANCY }}
-          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
-          key_file=$HOME/.oci/oci_api_key.pem
-          region=${{ secrets.OCI_CLI_REGION }}
-          EOF
-          chmod 600 ~/.oci/config
-          oci iam region list --config-file ~/.oci/config >/dev/null
+          OKE_IP=$(oci ce cluster get \
+            --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
+            --query 'data."endpoints"."private-endpoint"' \
+            --raw-output | cut -d: -f1)
+          echo "oke_private_ip=$OKE_IP" >> $GITHUB_ENV
 
-      - name: Create Bastion Session & Resolve OKE IP
-        shell: bash
-        run: |
-          OKE_PRIVATE_IP=$(oci ce cluster get --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" --query 'data."endpoints"."private-endpoint"' --raw-output | cut -d: -f1)
-          echo "oke_private_ip=${OKE_PRIVATE_IP}" >> $GITHUB_ENV
           SESSION_JSON=$(oci bastion session create-port-forwarding \
             --bastion-id "${{ secrets.BASTION_OCID }}" \
-            --display-name "github-oke-tunnel" \
-            --ssh-public-key-file ~/.ssh/id_rsa_updated.pub \
+            --display-name github-tunnel \
+            --ssh-public-key-file ~/.oci/oci_api_key.pem \
             --key-type PUB \
-            --target-private-ip "${OKE_PRIVATE_IP}" \
+            --target-private-ip $OKE_IP \
             --target-port 6443 \
             --wait-for-state SUCCEEDED)
-          BASTION_SESSION_OCID=$(echo "$SESSION_JSON" | jq -r '.data.id // .data.resources[0].identifier')
-          echo "bastion_session_ocid=${BASTION_SESSION_OCID}" >> $GITHUB_ENV
 
-      - name: Install kubectl
-        shell: bash
-        run: |
-          KVER=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-          curl -fsSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-          kubectl version --client --output=yaml
+          # Extract actual Bastion session OCID
+          BASTION_SESSION_OCID=$(echo "$SESSION_JSON" | jq -r '
+            .data.id // .data.resources[0].identifier // empty
+          ')
 
-      - name: Start SSH Tunnel
-        shell: bash
+          if [[ -z "$BASTION_SESSION_OCID" ]]; then
+            echo "Failed to get Bastion session OCID:"
+            echo "$SESSION_JSON"
+            exit 1
+          fi
+
+          echo "bastion_session_ocid=$BASTION_SESSION_OCID" >> $GITHUB_ENV
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Start SSH Tunnel to OKE
         run: |
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=accept-new -fN -L 6443:${{ env.oke_private_ip }}:6443 "${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }}"
-          for i in {1..15}; do nc -z 127.0.0.1 6443 && break || sleep 2; done
+          ssh -i ~/.oci/oci_api_key.pem \
+            -o StrictHostKeyChecking=accept-new \
+            -fN -L 6443:${{ env.oke_private_ip }}:6443 \
+            "${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }}"
+          for i in {1..15}; do
+            nc -z 127.0.0.1 6443 && break || sleep 2
+          done
 
       - name: Configure kubeconfig
-        shell: bash
         run: |
           mkdir -p ~/.kube
           oci ce cluster create-kubeconfig \
@@ -96,8 +93,7 @@ jobs:
           sed -i "s|${{ env.oke_private_ip }}|127.0.0.1|g" ~/.kube/config
           kubectl cluster-info
 
-      - name: Verify Cluster
-        shell: bash
+      - name: Verify Cluster Access
         run: |
           kubectl version
           kubectl get nodes -o wide
@@ -106,6 +102,6 @@ jobs:
 
       - name: Delete Bastion Session
         if: always()
-        shell: bash
         run: |
-          [ -n "${{ env.bastion_session_ocid }}" ] && oci bastion session delete --session-id "${{ env.bastion_session_ocid }}" --force || echo "No session to delete"
+          [ -n "${{ env.bastion_session_ocid }}" ] && \
+          oci bastion session delete --session-id "${{ env.bastion_session_ocid }}" --force || echo "No session to delete"
