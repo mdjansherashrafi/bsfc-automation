@@ -228,6 +228,7 @@ jobs:
           kubectl get nodes -o wide
           echo "List namespaces (read-only)"
           kubectl get ns
+          kubectl get pods -A
 
    #   - name: Deploy to OKE
      #   shell: bash
