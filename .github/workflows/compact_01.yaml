@@ -16,19 +16,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up OCI CLI
-        uses: oracle-actions/oci-cli@v2
-        with:
-          oci-cli-version: latest
-          oci-config: |
-            [DEFAULT]
-            user=${{ secrets.OCI_CLI_USER }}
-            tenancy=${{ secrets.OCI_CLI_TENANCY }}
-            fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
-            key_file=$HOME/.oci/oci_api_key.pem
-            region=${{ secrets.OCI_CLI_REGION }}
+      - name: Install OCI CLI
+        run: |
+           bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)" -- --accept-all-defaults --exec-dir $HOME/bin --install-dir $HOME/lib
+           echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure OCI CLI
+        run: |
+         mkdir -p $HOME/.oci
+         echo "$OCI_CLI_KEY_CONTENT" > $HOME/.oci/oci_api_key.pem
+         chmod 600 $HOME/.oci/oci_api_key.pem
+         cat > $HOME/.oci/config <<EOF
+         [DEFAULT]
+         user=${{ secrets.OCI_CLI_USER }}
+         tenancy=${{ secrets.OCI_CLI_TENANCY }}
+         fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+         key_file=$HOME/.oci/oci_api_key.pem
+         region=${{ secrets.OCI_CLI_REGION }}
+         EOF
         env:
-          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+         OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
 
       - name: Write OCI API Key
         run: |
