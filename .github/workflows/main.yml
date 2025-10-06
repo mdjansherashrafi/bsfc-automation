@@ -1,6 +1,7 @@
 name: CI - Deploy to OKE
 
-on: [push]
+on:
+  workflow_dispatch:
 
 jobs:
   deploy:
