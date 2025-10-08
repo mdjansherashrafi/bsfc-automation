@@ -1,0 +1,163 @@
+name: CI/CD - Build & Deploy to OKE
+
+on: [push]
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-22.04
+
+    env:
+      OCI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      OCIR: ${{ secrets.OCIR_REGION }}          # e.g. me-jeddah-1.ocir.io
+      OCIR_REPO: ${{ secrets.OCIR_REPO }}       # e.g. dfs44gfga5g/myapp
+      IMAGE_NAME: myapp
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 🧱 Build Docker Image (Auto Tag)
+      - name: Build Docker Image
+        run: |
+          set -euxo pipefail
+          IMAGE_TAG="build-${GITHUB_RUN_NUMBER}"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          docker build -t $OCIR/$OCIR_REPO/$IMAGE_NAME:$IMAGE_TAG .
+          docker tag $OCIR/$OCIR_REPO/$IMAGE_NAME:$IMAGE_TAG $OCIR/$OCIR_REPO/$IMAGE_NAME:latest
+
+      # 🔐 Login to OCIR
+      - name: Login to OCIR
+        run: |
+          set -euxo pipefail
+          echo "${{ secrets.OCI_AUTH_TOKEN }}" | docker login $OCIR -u "${{ secrets.OCI_USERNAME }}" --password-stdin
+
+      # 🚀 Push Image (versioned + latest)
+      - name: Push Docker Image
+        run: |
+          set -euxo pipefail
+          docker push $OCIR/$OCIR_REPO/$IMAGE_NAME:$IMAGE_TAG
+          docker push $OCIR/$OCIR_REPO/$IMAGE_NAME:latest
+
+      # 🧰 Install OCI CLI & kubectl
+      - name: Install OCI CLI & kubectl
+        run: |
+          set -euxo pipefail
+          if ! command -v oci >/dev/null; then
+            curl -fsSL -o install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+            chmod +x install.sh
+            sudo ./install.sh --accept-all-defaults \
+              --install-dir /usr/local/lib/oracle-cli \
+              --exec-dir /usr/local/bin
+            echo "/usr/local/bin" >> $GITHUB_PATH
+            hash -r
+          fi
+          oci --version
+          curl -fsSLo kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
+      # ⚙️ Configure OCI CLI
+      - name: Configure OCI CLI
+        run: |
+          set -euxo pipefail
+          mkdir -p ~/.oci
+          echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_CLI_USER }}
+          tenancy=${{ secrets.OCI_CLI_TENANCY }}
+          fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}
+          key_file=$HOME/.oci/oci_api_key.pem
+          region=${{ env.OCI_REGION }}
+          EOF
+          chmod 600 ~/.oci/config
+          oci iam region list >/dev/null
+
+      # 🔐 Setup Bastion SSH Session
+      - name: Setup Bastion SSH Session
+        run: |
+          set -euxo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+          ssh-keyscan -H "${{ secrets.BASTION_HOST }}" >> ~/.ssh/known_hosts
+
+          # 🔹 Get OKE private endpoint IP
+          OKE_PRIVATE_IP=$(oci ce cluster get \
+            --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
+            --query 'data."endpoints"."private-endpoint"' \
+            --raw-output | cut -d: -f1)
+          echo "oke_private_ip=$OKE_PRIVATE_IP" >> $GITHUB_ENV
+
+          # 🔹 Create Bastion session
+          SESSION_JSON=$(oci bastion session create-port-forwarding \
+            --bastion-id "${{ secrets.BASTION_OCID }}" \
+            --display-name "gh-oke-tunnel" \
+            --ssh-public-key-file ~/.ssh/id_rsa.pub \
+            --target-private-ip "$OKE_PRIVATE_IP" \
+            --target-port 6443)
+          SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.data.id')
+          echo "✅ Created Bastion Session: $SESSION_ID"
+          echo "bastion_session_ocid=$SESSION_ID" >> $GITHUB_ENV
+
+      # ⏱️ Wait for Bastion Session ACTIVE
+      - name: Wait for Bastion Session Ready
+        run: |
+          set -euxo pipefail
+          for i in {1..10}; do
+            STATE=$(oci bastion session get \
+              --session-id "${{ env.bastion_session_ocid }}" \
+              --query 'data."lifecycle-state"' --raw-output)
+            echo "Session state: $STATE"
+            [ "$STATE" = "ACTIVE" ] && break || sleep 5
+          done
+
+      # 🌉 Start SSH Tunnel
+      - name: Start SSH Tunnel
+        run: |
+          set -euxo pipefail
+          echo "Starting tunnel to ${{ env.oke_private_ip }} via ${{ env.bastion_session_ocid }}"
+          ssh -i ~/.ssh/id_rsa \
+            -fN -L 6443:${{ env.oke_private_ip }}:6443 \
+            "${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }}"
+          for i in {1..10}; do
+            nc -z 127.0.0.1 6443 && echo "✅ Tunnel ready" && break || sleep 2
+          done
+
+      # 🧭 Configure Kubeconfig for OKE
+      - name: Configure OKE Kubeconfig
+        run: |
+          set -euxo pipefail
+          mkdir -p ~/.kube
+          oci ce cluster create-kubeconfig \
+            --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
+            --file ~/.kube/config \
+            --region "${{ env.OCI_REGION }}" \
+            --token-version 2.0.0 \
+            --kube-endpoint PRIVATE_ENDPOINT
+          sed -i "s|${{ env.oke_private_ip }}|127.0.0.1|g" ~/.kube/config
+          kubectl cluster-info
+
+      # ✅ Verify Cluster Access
+      - name: Verify Cluster
+        run: |
+          set -euxo pipefail
+          kubectl get nodes -o wide
+          kubectl get ns
+
+      # 🚀 Deploy App to OKE
+      - name: Deploy to OKE
+        run: |
+          set -euxo pipefail
+          NS=app
+          kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
+          # Patch deployment image dynamically
+          yq e -i '.spec.template.spec.containers[0].image = strenv(OCIR) + "/" + strenv(OCIR_REPO) + "/" + strenv(IMAGE_NAME) + ":" + strenv(IMAGE_TAG)' k8s/deployment.yaml
+          kubectl apply -n "$NS" -f k8s/deployment.yaml
+          kubectl rollout status -n "$NS" deploy/${{ env.IMAGE_NAME }} --timeout=180s
+          echo "✅ Deployment completed successfully!"
+
+      # 🧹 Cleanup Bastion Session
+      - name: Cleanup Bastion Session
+        if: always()
+        run: |
+          set -euxo pipefail
+          oci bastion session delete --session-id "${{ env.bastion_session_ocid }}" --force || true
