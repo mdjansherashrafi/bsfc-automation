@@ -32,8 +32,6 @@ jobs:
          # install kubectl
          curl -fsSLo kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
          sudo install -m 0755 kubectl /usr/local/bin/kubectl
-
-
       - name: Configure OCI CLI
         run: |
           set -euxo pipefail
@@ -63,23 +61,36 @@ jobs:
          --raw-output | cut -d: -f1)
          echo "oke_private_ip=$OKE_PRIVATE_IP" >> $GITHUB_ENV
 
-         SESSION_JSON=$(oci bastion session create-port-forwarding \
-         --bastion-id "${{ secrets.BASTION_OCID }}" \
-         --display-name "gh-oke-tunnel" \
-         --ssh-public-key-file ~/.ssh/id_rsa.pub \
-         --target-private-ip "$OKE_PRIVATE_IP" \
-         --target-port 6443 \
-         --wait-for-state SUCCEEDED)
+         # create session and capture work request id
+          SESSION_WR_JSON=$(oci bastion session create-port-forwarding \
+          --bastion-id "${{ secrets.BASTION_OCID }}" \
+          --display-name "gh-oke-tunnel" \
+          --ssh-public-key-file ~/.ssh/id_rsa.pub \
+          --target-private-ip "$OKE_PRIVATE_IP" \
+          --target-port 6443)
 
-         SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.data.id')
+         WR_ID=$(echo "$SESSION_WR_JSON" | jq -r '.opcWorkRequestId // .opc-work-request-id')
+         echo "Work Request: $WR_ID"
+
+         # fetch actual session ocid
+         SESSION_ID=$(oci work-requests work-request get \
+         --work-request-id "$WR_ID" \
+         --query 'data.resources[0].identifier' \
+         --raw-output)
+
          echo "bastion_session_ocid=$SESSION_ID" >> $GITHUB_ENV
 
 
-      - name: Start Tunnel & Configure kubeconfig
+      - name: Start Tunnel
         run: |
-          set -euxo pipefail
-          ssh -i ~/.ssh/id_rsa -fN -L 6443:${{ env.oke_private_ip }}:6443 "${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }}"
-          for i in {1..10}; do nc -z 127.0.0.1 6443 && break || sleep 2; done
+         set -euxo pipefail
+         ssh -i ~/.ssh/id_rsa \
+         -fN -L 6443:${{ env.oke_private_ip }}:6443 \
+         "${{ env.bastion_session_ocid }}@${{ secrets.BASTION_HOST }}"
+         for i in {1..10}; do
+         nc -z 127.0.0.1 6443 && break || sleep 2
+         done
+
           mkdir -p ~/.kube
           oci ce cluster create-kubeconfig \
             --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
