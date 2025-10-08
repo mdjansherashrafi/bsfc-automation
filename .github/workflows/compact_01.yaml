@@ -1,4 +1,4 @@
-name: CI - Deploy to OKE
+name: CI - Deploy to OKE_01
 on:
   workflow_dispatch:
 
