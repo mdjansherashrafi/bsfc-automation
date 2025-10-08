@@ -50,27 +50,30 @@ jobs:
           EOF
           oci iam region list >/dev/null
 
-      - name: Setup SSH & Bastion
+      - name: Setup Bastion SSH Tunnel
         run: |
-          set -euxo pipefail
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
-          ssh-keyscan -H "${{ secrets.BASTION_HOST }}" >> ~/.ssh/known_hosts
-          PUB=$(tr -d '\n' < ~/.ssh/id_rsa.pub)
+         set -euxo pipefail
+         mkdir -p ~/.ssh && chmod 700 ~/.ssh
+         ssh-keygen -b 2048 -t rsa -f ~/.ssh/id_rsa -q -N ""
+         ssh-keyscan -H "${{ secrets.BASTION_HOST }}" >> ~/.ssh/known_hosts
 
-          OKE_PRIVATE_IP=$(oci ce cluster get --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" --query 'data."endpoints"."private-endpoint"' --raw-output | cut -d: -f1)
-          echo "oke_private_ip=$OKE_PRIVATE_IP" >> $GITHUB_ENV
+         OKE_PRIVATE_IP=$(oci ce cluster get \
+         --cluster-id "${{ secrets.OKE_CLUSTER_OCID }}" \
+         --query 'data."endpoints"."private-endpoint"' \
+         --raw-output | cut -d: -f1)
+         echo "oke_private_ip=$OKE_PRIVATE_IP" >> $GITHUB_ENV
 
-          SESSION_JSON=$(oci bastion session create-port-forwarding \
-            --bastion-id "${{ secrets.BASTION_OCID }}" \
-            --display-name "gh-oke-tunnel" \
-            --ssh-public-key-content "$PUB" \
-            --target-private-ip "$OKE_PRIVATE_IP" \
-            --target-port 6443 \
-            --wait-for-state SUCCEEDED)
+         SESSION_JSON=$(oci bastion session create-port-forwarding \
+         --bastion-id "${{ secrets.BASTION_OCID }}" \
+         --display-name "gh-oke-tunnel" \
+         --ssh-public-key-file ~/.ssh/id_rsa.pub \
+         --target-private-ip "$OKE_PRIVATE_IP" \
+         --target-port 6443 \
+         --wait-for-state SUCCEEDED)
 
-          SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.data.id')
-          echo "bastion_session_ocid=$SESSION_ID" >> $GITHUB_ENV
+         SESSION_ID=$(echo "$SESSION_JSON" | jq -r '.data.id')
+         echo "bastion_session_ocid=$SESSION_ID" >> $GITHUB_ENV
+
 
       - name: Start Tunnel & Configure kubeconfig
         run: |
