@@ -17,13 +17,20 @@ jobs:
 
       - name: Install OCI CLI & kubectl
         run: |
-          set -euxo pipefail
-          if ! command -v oci >/dev/null; then
-            curl -fsSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh | sudo bash -s -- --accept-all-defaults
-          fi
-          oci --version
-          curl -fsSLo kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+         set -euxo pipefail
+         if ! command -v oci >/dev/null; then
+         curl -fsSL -o install.sh https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+         chmod +x install.sh
+         sudo ./install.sh --accept-all-defaults \
+         --install-dir /usr/local/lib/oracle-cli \
+         --exec-dir /usr/local/bin \
+         --update-path yes
+         hash -r
+         fi
+         oci --version
+         curl -fsSLo kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+         sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
 
       - name: Configure OCI CLI
         run: |
